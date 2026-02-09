@@ -1,0 +1,1 @@
+[NON_TEXT_MESSAGE] type=ContentType.PHOTO

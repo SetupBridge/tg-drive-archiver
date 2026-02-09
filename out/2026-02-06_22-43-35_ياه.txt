@@ -1,0 +1,3 @@
+NOTE: ياه
+
+[NON_TEXT_MESSAGE] type=ContentType.FORUM_TOPIC_CREATED
