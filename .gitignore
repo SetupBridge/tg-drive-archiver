@@ -1,7 +1,12 @@
 venv/
 __pycache__/
 *.pyc
+
 client_secret.json
-data.json
+.env
+
+data/
+storage/
+
 logs/
 tmp/
