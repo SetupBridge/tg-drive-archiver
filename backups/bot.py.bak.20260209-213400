@@ -1,0 +1,556 @@
+
+import os
+import re
+import json
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, Tuple
+
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.exceptions import MessageToDeleteNotFound, MessageCantBeDeleted, ChatNotFound
+
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
+# =========================
+# CONFIG / PATHS
+# =========================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+TOKENS_DIR = os.path.join(DATA_DIR, "tokens")
+TMP_DIR = os.path.join(DATA_DIR, "tmp")
+STORAGE_PATH = os.path.join(DATA_DIR, "storage.json")
+CLIENT_SECRET_PATH = os.path.join(BASE_DIR, "client_secret.json")
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(TOKENS_DIR, exist_ok=True)
+os.makedirs(TMP_DIR, exist_ok=True)
+
+# Google scopes (Drive + Sheets ready)
+SCOPES = [
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
+
+AUTO_DELETE_SECONDS = 3
+
+# =========================
+# LOGGING
+# =========================
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOGS_DIR, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(LOGS_DIR, "bot.log"), encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("tg-drive-archiver")
+
+# =========================
+# ENV LOADER (بدون مكتبات إضافية)
+# =========================
+def load_env_file(path: str) -> Dict[str, str]:
+    if not os.path.exists(path):
+        return {}
+    out: Dict[str, str] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+env_map = load_env_file(ENV_PATH)
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or env_map.get("BOT_TOKEN") or "").strip()
+
+if not BOT_TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN غير موجود. حطه في ملف .env بهذا الشكل:\n\nBOT_TOKEN=توكنك_هنا\n")
+
+if not os.path.exists(CLIENT_SECRET_PATH):
+    raise RuntimeError("❌ ملف client_secret.json غير موجود في نفس مجلد bot.py")
+
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher(bot)
+
+# =========================
+# SIMPLE STORAGE
+# =========================
+def _load_storage() -> Dict[str, Any]:
+    if not os.path.exists(STORAGE_PATH):
+        return {}
+    try:
+        with open(STORAGE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_storage(data: Dict[str, Any]) -> None:
+    tmp = STORAGE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STORAGE_PATH)
+
+def storage_get(key: str, default=None):
+    data = _load_storage()
+    return data.get(key, default)
+
+def storage_set(key: str, value) -> None:
+    data = _load_storage()
+    data[key] = value
+    _save_storage(data)
+
+def token_path(user_id: int) -> str:
+    return os.path.join(TOKENS_DIR, f"{user_id}.json")
+
+def save_user_creds(user_id: int, creds: Credentials) -> None:
+    with open(token_path(user_id), "w", encoding="utf-8") as f:
+        f.write(creds.to_json())
+
+def load_user_creds(user_id: int) -> Optional[Credentials]:
+    p = token_path(user_id)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        creds = Credentials.from_authorized_user_info(data, SCOPES)
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                save_user_creds(user_id, creds)
+            except Exception as e:
+                logger.warning("Token refresh failed: %s", e)
+        return creds
+    except Exception as e:
+        logger.warning("Failed to load creds: %s", e)
+        return None
+
+# =========================
+# UI (KEYBOARD)
+# =========================
+def kb_main() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🔧 إعداد Google Drive (Setup)", callback_data="setup"),
+        InlineKeyboardButton("ℹ️ معلومات", callback_data="info"),
+    )
+    kb.add(InlineKeyboardButton("🆘 مساعدة", callback_data="help"))
+    return kb
+
+WELCOME_TEXT = (
+    "👋 <b>مرحبًا بك في بوت الأرشفة (GroupArchive)</b>\n\n"
+    "هذا البوت يخلّيك تحفظ رسائل/صور/ملفات من مجموعاتك مباشرة في <b>Google Drive</b>.\n\n"
+    "✅ <b>ابدأ الآن:</b> اضغط زر <b>Setup</b> لربط Google Drive.\n"
+    "ℹ️ وإذا تبغى تفاصيل أكثر اضغط <b>معلومات</b>."
+)
+
+INFO_TEXT = (
+    "ℹ️ <b>معلومات عن البوت</b>\n\n"
+    "• يحفظ أي رسالة ترد عليها بـ <b>/archive</b> داخل الجروب.\n"
+    "• يرفع الملفات إلى Google Drive داخل مجلد خاص بالمجموعة.\n"
+    "• ما يرسل لك روابط (فقط: جاري المعالجة → تمت الأرشفة ✅).\n\n"
+    "<b>مهم:</b> لو تبغى ميزة تنظيف الرسائل تلقائيًا (حذف أوامر /archive ورسائل البوت)،\n"
+    "خلي البوت <b>Admin</b> في المجموعة وفعّل له صلاحية:\n"
+    "✅ <b>Delete messages</b>\n\n"
+    "🔒 <b>طمّنة:</b> البوت ما يحذف رسائلك العادية، فقط أوامر الأرشفة ورسائل البوت (إذا الصلاحية موجودة)."
+)
+
+HELP_TEXT = (
+    "🆘 <b>مساعدة سريعة</b>\n\n"
+    "1) في الخاص: اضغط <b>Setup</b> واربط Google Drive.\n"
+    "2) في المجموعة: رد على أي رسالة/صورة/ملف واكتب <b>/archive</b>.\n\n"
+    "لو ما انحفظ شيء في Drive:\n"
+    "• تأكد إن الربط تم من الخاص.\n"
+    "• وتأكد إن البوت موجود في المجموعة.\n"
+    "• وإذا تبي حذف تلقائي: اعطه صلاحية Delete messages."
+)
+
+# =========================
+# PERMISSIONS / AUTO DELETE
+# =========================
+async def can_delete_in_chat(chat_id: int) -> bool:
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        # لازم يكون Admin أو Creator وعنده delete_messages
+        if member.status in ("administrator", "creator"):
+            # في aiogram 2: ChatMemberAdministrator لديه can_delete_messages
+            can_del = getattr(member, "can_delete_messages", False)
+            return bool(can_del) or member.status == "creator"
+        return False
+    except Exception:
+        return False
+
+async def safe_delete(chat_id: int, message_id: int) -> None:
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except (MessageToDeleteNotFound, MessageCantBeDeleted, ChatNotFound):
+        pass
+    except Exception:
+        pass
+
+async def auto_delete_message(msg: types.Message, delay: int = AUTO_DELETE_SECONDS) -> None:
+    await asyncio.sleep(delay)
+    await safe_delete(msg.chat.id, msg.message_id)
+
+# =========================
+# GOOGLE HELPERS
+# =========================
+def drive_service(creds: Credentials):
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+def _chat_key(chat_id: int) -> str:
+    return f"chat:{chat_id}"
+
+def _user_state_key(user_id: int) -> str:
+    return f"user_state:{user_id}"
+
+def set_user_state(user_id: int, state: Optional[Dict[str, Any]]) -> None:
+    if state is None:
+        storage_set(_user_state_key(user_id), None)
+    else:
+        storage_set(_user_state_key(user_id), state)
+
+def get_user_state(user_id: int) -> Optional[Dict[str, Any]]:
+    st = storage_get(_user_state_key(user_id))
+    return st if isinstance(st, dict) else None
+
+def get_or_create_folder_id(creds: Credentials, chat_id: int, chat_title: str) -> str:
+    data = storage_get(_chat_key(chat_id), {}) or {}
+    folder_id = data.get("drive_folder_id")
+    if folder_id:
+        return folder_id
+
+    svc = drive_service(creds)
+    folder_name = f"TG Archive - {chat_title or chat_id}"
+    file_metadata = {
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+    }
+    folder = svc.files().create(body=file_metadata, fields="id").execute()
+    folder_id = folder["id"]
+
+    data["drive_folder_id"] = folder_id
+    storage_set(_chat_key(chat_id), data)
+    return folder_id
+
+def upload_file_to_drive(
+    creds: Credentials,
+    folder_id: str,
+    local_path: str,
+    drive_name: str,
+    mime_type: str,
+) -> str:
+    svc = drive_service(creds)
+    metadata = {"name": drive_name, "parents": [folder_id]}
+    media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
+    created = svc.files().create(body=metadata, media_body=media, fields="id").execute()
+    return created["id"]
+
+# =========================
+# BOT COMMANDS (قائمة السلاش)
+# =========================
+async def setup_bot_commands() -> None:
+    commands = [
+        types.BotCommand("start", "بدء / القائمة الرئيسية"),
+        types.BotCommand("setup", "ربط Google Drive (في الخاص فقط)"),
+        types.BotCommand("info", "معلومات عن البوت"),
+        types.BotCommand("help", "مساعدة"),
+        types.BotCommand("archive", "أرشفة (في الجروب، رد على رسالة)"),
+    ]
+    try:
+        await bot.set_my_commands(commands)
+    except Exception as e:
+        logger.warning("set_my_commands failed: %s", e)
+
+# =========================
+# PRIVATE: START / INFO / HELP
+# =========================
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: types.Message):
+    if message.chat.type != types.ChatType.PRIVATE:
+        # ما نبي start في الجروب
+        return
+    await setup_bot_commands()
+    await message.answer(WELCOME_TEXT, reply_markup=kb_main())
+
+@dp.message_handler(commands=["info"])
+async def cmd_info(message: types.Message):
+    if message.chat.type != types.ChatType.PRIVATE:
+        return
+    await message.answer(INFO_TEXT, reply_markup=kb_main())
+
+@dp.message_handler(commands=["help"])
+async def cmd_help(message: types.Message):
+    if message.chat.type != types.ChatType.PRIVATE:
+        return
+    await message.answer(HELP_TEXT, reply_markup=kb_main())
+
+@dp.callback_query_handler(lambda c: c.data in ("info", "help"))
+async def cb_info_help(call: types.CallbackQuery):
+    try:
+        await call.answer()
+    except Exception:
+        pass
+    if call.message.chat.type != types.ChatType.PRIVATE:
+        return
+    if call.data == "info":
+        await call.message.answer(INFO_TEXT, reply_markup=kb_main())
+    else:
+        await call.message.answer(HELP_TEXT, reply_markup=kb_main())
+
+# =========================
+# PRIVATE: SETUP FLOW
+# =========================
+def build_oauth_url(user_id: int) -> Tuple[str, Dict[str, Any]]:
+    # OOB flow (يطلع كود يننسخ ويلصق)
+    flow = InstalledAppFlow.from_client_secrets_file(
+        CLIENT_SECRET_PATH,
+        scopes=SCOPES,
+        redirect_uri="urn:ietf:wg:oauth:2.0:oob",
+    )
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+        state=str(user_id),
+    )
+    # نخزن state اننا ننتظر كود
+    state = {"awaiting": "google_code", "ts": int(datetime.now(tz=timezone.utc).timestamp())}
+    return auth_url, state
+
+async def send_setup_instructions(message: types.Message) -> None:
+    auth_url, st = build_oauth_url(message.from_user.id)
+    set_user_state(message.from_user.id, st)
+
+    txt = (
+        "🔗 <b>خطوة الربط مع Google Drive</b>\n\n"
+        "1) افتح الرابط التالي:\n"
+        f"{auth_url}\n\n"
+        "2) سجّل دخولك واسمح بالصلاحيات.\n"
+        "3) Google بيعطيك <b>كود</b>.\n\n"
+        "✅ <b>ألصق الكود هنا مباشرة</b> في نفس المحادثة (بدون أي أمر)."
+    )
+    await message.answer(txt, reply_markup=kb_main())
+
+@dp.message_handler(commands=["setup"])
+async def cmd_setup(message: types.Message):
+    if message.chat.type != types.ChatType.PRIVATE:
+        await message.reply("⚠️ أمر Setup لازم يكون في الخاص فقط. افتح الخاص مع البوت واضغط Setup.")
+        return
+    await send_setup_instructions(message)
+
+@dp.callback_query_handler(lambda c: c.data == "setup")
+async def cb_setup(call: types.CallbackQuery):
+    try:
+        await call.answer()
+    except Exception:
+        pass
+    if call.message.chat.type != types.ChatType.PRIVATE:
+        return
+    await send_setup_instructions(call.message)
+
+@dp.message_handler(content_types=types.ContentTypes.TEXT)
+async def handle_text(message: types.Message):
+    # استقبال كود Google في الخاص فقط
+    if message.chat.type != types.ChatType.PRIVATE:
+        return
+
+    st = get_user_state(message.from_user.id)
+    if not st or st.get("awaiting") != "google_code":
+        return
+
+    code = message.text.strip()
+    # تنظيف شائع لو المستخدم يلصق مع مسافات/سطر
+    code = re.sub(r"\s+", "", code)
+
+    status = await message.reply("⏳ جاري ربط Google Drive…")
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(
+            CLIENT_SECRET_PATH,
+            scopes=SCOPES,
+            redirect_uri="urn:ietf:wg:oauth:2.0:oob",
+        )
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        save_user_creds(message.from_user.id, creds)
+        set_user_state(message.from_user.id, None)
+
+        await status.edit_text("✅ تم ربط Google Drive بنجاح!\n\nالآن ارجع لمجموعتك ورد على أي رسالة بـ /archive.")
+        asyncio.create_task(auto_delete_message(status, delay=10))
+        asyncio.create_task(auto_delete_message(message, delay=10))
+    except Exception as e:
+        logger.exception("Setup failed: %s", e)
+        await status.edit_text("❌ ما ضبط الربط. جرّب مرّة ثانية واضغط Setup من جديد.")
+        asyncio.create_task(auto_delete_message(status, delay=10))
+
+# =========================
+# GROUP: ARCHIVE
+# =========================
+ARCHIVE_CMD = "archive"
+
+def is_group_chat(chat: types.Chat) -> bool:
+    return chat.type in (types.ChatType.GROUP, types.ChatType.SUPERGROUP)
+
+async def ensure_drive_ready(user_id: int) -> Optional[Credentials]:
+    creds = load_user_creds(user_id)
+    return creds
+
+def make_drive_filename(prefix: str, ext: str) -> str:
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    safe_prefix = re.sub(r"[^a-zA-Z0-9_\-]+", "_", prefix)[:40].strip("_") or "item"
+    return f"{safe_prefix}_{ts}.{ext}"
+
+async def download_telegram_file(file_id: str, dest_path: str) -> None:
+    f = await bot.get_file(file_id)
+    await bot.download_file(f.file_path, destination=dest_path)
+
+def detect_reply_payload(msg: types.Message) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    returns (kind, file_id, mime_type)
+    kind: 'text' or 'file'
+    """
+    r = msg.reply_to_message
+    if not r:
+        return (None, None, None)
+
+    # File types
+    if r.document:
+        return ("file", r.document.file_id, r.document.mime_type or "application/octet-stream")
+    if r.photo:
+        # أكبر مقاس
+        return ("file", r.photo[-1].file_id, "image/jpeg")
+    if r.video:
+        return ("file", r.video.file_id, r.video.mime_type or "video/mp4")
+    if r.audio:
+        return ("file", r.audio.file_id, r.audio.mime_type or "audio/mpeg")
+    if r.voice:
+        return ("file", r.voice.file_id, "audio/ogg")
+    if r.animation:
+        return ("file", r.animation.file_id, "video/mp4")
+    if r.sticker:
+        return ("file", r.sticker.file_id, "image/webp")
+
+    # Text
+    text = (r.text or r.caption or "").strip()
+    if text:
+        return ("text", text, "text/plain")
+
+    return (None, None, None)
+
+@dp.message_handler(commands=[ARCHIVE_CMD])
+async def cmd_archive(message: types.Message):
+    # فقط في الجروب
+    if not is_group_chat(message.chat):
+        await message.reply("⚠️ الأرشفة تستخدم داخل المجموعات فقط.\nروح للجروب ورد على رسالة بـ /archive.")
+        return
+
+    # لازم رد
+    if not message.reply_to_message:
+        tmp = await message.reply("⚠️ رد على الرسالة اللي تبغى تحفظها ثم اكتب /archive.")
+        # حذف رسائل البوت بعد 3 ثواني إذا نقدر
+        if await can_delete_in_chat(message.chat.id):
+            asyncio.create_task(auto_delete_message(tmp))
+            asyncio.create_task(auto_delete_message(message))
+        return
+
+    # تحقق الربط
+    creds = await ensure_drive_ready(message.from_user.id)
+    if not creds:
+        tmp = await message.reply("⚠️ الأرشفة غير مفعّلة لك. افتح الخاص مع البوت واضغط Setup لربط Google Drive.")
+        if await can_delete_in_chat(message.chat.id):
+            asyncio.create_task(auto_delete_message(tmp, delay=8))
+            asyncio.create_task(auto_delete_message(message, delay=8))
+        return
+
+    kind, payload, mime = detect_reply_payload(message)
+    if not kind:
+        tmp = await message.reply("⚠️ ما قدرت أحدد محتوى الرسالة. جرّب على نص/صورة/ملف.")
+        if await can_delete_in_chat(message.chat.id):
+            asyncio.create_task(auto_delete_message(tmp))
+            asyncio.create_task(auto_delete_message(message))
+        return
+
+    # status
+    status = await message.reply("⏳ جاري المعالجة…")
+
+    try:
+        folder_id = get_or_create_folder_id(creds, message.chat.id, message.chat.title or str(message.chat.id))
+
+        if kind == "text":
+            text = str(payload)
+            fname = make_drive_filename("text", "txt")
+            local_path = os.path.join(TMP_DIR, fname)
+            with open(local_path, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+            upload_file_to_drive(creds, folder_id, local_path, fname, "text/plain")
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+
+        else:
+            file_id = str(payload)
+            # نختار امتداد بسيط حسب mime
+            ext = "bin"
+            if mime:
+                if "pdf" in mime:
+                    ext = "pdf"
+                elif "jpeg" in mime or "jpg" in mime:
+                    ext = "jpg"
+                elif "png" in mime:
+                    ext = "png"
+                elif "mp4" in mime:
+                    ext = "mp4"
+                elif "mpeg" in mime or "mp3" in mime:
+                    ext = "mp3"
+                elif "ogg" in mime:
+                    ext = "ogg"
+                elif "webp" in mime:
+                    ext = "webp"
+
+            fname = make_drive_filename("file", ext)
+            local_path = os.path.join(TMP_DIR, fname)
+            await download_telegram_file(file_id, local_path)
+            upload_file_to_drive(creds, folder_id, local_path, fname, mime or "application/octet-stream")
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+
+        await status.edit_text("✅ تمت الأرشفة")
+    except Exception as e:
+        logger.exception("Archive failed: %s", e)
+        await status.edit_text("❌ صار خطأ أثناء الأرشفة. جرّب مرة ثانية.")
+    finally:
+        # حذف الرسائل حسب الصلاحية
+        if await can_delete_in_chat(message.chat.id):
+            asyncio.create_task(auto_delete_message(status))
+            asyncio.create_task(auto_delete_message(message))
+        else:
+            # حتى لو ما نقدر نحذف، نخلي رسالة الحالة تختفي بعد 10 ثواني (في الخاص فقط ما يهم)
+            asyncio.create_task(auto_delete_message(status, delay=10))
+
+# =========================
+# STARTUP
+# =========================
+async def on_startup(_dp: Dispatcher):
+    await setup_bot_commands()
+    logger.info("Bot started.")
+
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+PY

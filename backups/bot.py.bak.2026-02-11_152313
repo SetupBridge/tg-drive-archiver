@@ -1,0 +1,460 @@
+# -*- coding: utf-8 -*-
+
+import os
+import json
+import uuid
+import time
+import asyncio
+import logging
+from typing import Optional, Dict, Any
+from datetime import datetime, timezone
+
+import aiohttp
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils import executor
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.exceptions import NetworkError, RetryAfter, TelegramAPIError
+
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
+# =========================
+# Simple ENV loader (بدون dotenv)
+# =========================
+def load_env_file(path: str = ".env") -> None:
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                os.environ[k] = v
+    except Exception:
+        pass
+
+
+load_env_file()
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+GOOGLE_CLIENT_SECRET_FILE = os.environ.get("GOOGLE_CLIENT_SECRET_FILE", "client_secret.json").strip()
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing in .env")
+if not os.path.exists(GOOGLE_CLIENT_SECRET_FILE):
+    raise RuntimeError(f"Google client secret file not found: {GOOGLE_CLIENT_SECRET_FILE}")
+
+# =========================
+# Logging
+# =========================
+os.makedirs("logs", exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[
+        logging.FileHandler("logs/bot.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger("tg-drive-archiver")
+
+# =========================
+# Bot
+# =========================
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher(bot)
+
+# =========================
+# Storage (creds per USER)
+# =========================
+DATA_DIR = "data"
+CREDS_DIR = os.path.join(DATA_DIR, "creds")
+os.makedirs(CREDS_DIR, exist_ok=True)
+
+def creds_path(user_id: int) -> str:
+    return os.path.join(CREDS_DIR, f"{user_id}.json")
+
+def save_creds(user_id: int, creds: Credentials) -> None:
+    with open(creds_path(user_id), "w", encoding="utf-8") as f:
+        f.write(creds.to_json())
+
+def load_creds(user_id: int) -> Optional[Credentials]:
+    p = creds_path(user_id)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = f.read()
+        return Credentials.from_authorized_user_info(json.loads(data))
+    except Exception:
+        return None
+
+def ensure_valid_creds(user_id: int) -> Optional[Credentials]:
+    creds = load_creds(user_id)
+    if not creds:
+        return None
+
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            save_creds(user_id, creds)
+        except RefreshError:
+            return None
+
+    return creds
+
+# =========================
+# Google Device Flow (بدون صفحة)
+# =========================
+GOOGLE_DEVICE_AUTH_URL = "https://oauth2.googleapis.com/device/code"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+
+def _read_client_secret() -> Dict[str, Any]:
+    with open(GOOGLE_CLIENT_SECRET_FILE, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    # device flow غالبًا "installed" أو "web" حسب الملف
+    if "installed" in raw:
+        return raw["installed"]
+    if "web" in raw:
+        return raw["web"]
+    raise RuntimeError("client_secret.json format not recognized (expected installed/web)")
+
+async def google_start_device_flow() -> Dict[str, Any]:
+    client = _read_client_secret()
+    client_id = client.get("client_id")
+    if not client_id:
+        raise RuntimeError("client_id missing in client_secret.json")
+
+    # Scopes: Drive file creation
+    scope = "https://www.googleapis.com/auth/drive.file"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            GOOGLE_DEVICE_AUTH_URL,
+            data={
+                "client_id": client_id,
+                "scope": scope
+            },
+            timeout=30
+        ) as r:
+            text = await r.text()
+            if r.status != 200:
+                raise RuntimeError(f"DeviceFlow start error {r.status}: {text}")
+            return json.loads(text)
+
+async def google_poll_token(device_code: str, interval: int = 5, timeout_sec: int = 300) -> Dict[str, Any]:
+    client = _read_client_secret()
+    client_id = client.get("client_id")
+    client_secret = client.get("client_secret")
+
+    start = time.time()
+    async with aiohttp.ClientSession() as session:
+        while True:
+            if time.time() - start > timeout_sec:
+                raise RuntimeError("DeviceFlow timeout, try again")
+
+            async with session.post(
+                GOOGLE_TOKEN_URL,
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "device_code": device_code,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                },
+                timeout=30
+            ) as r:
+                text = await r.text()
+                data = {}
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    pass
+
+                if r.status == 200 and "access_token" in data:
+                    return data
+
+                # expected pending responses
+                err = data.get("error")
+                if err in ("authorization_pending", "slow_down"):
+                    await asyncio.sleep(interval + (2 if err == "slow_down" else 0))
+                    continue
+
+                raise RuntimeError(f"DeviceFlow token error {r.status}: {text}")
+
+# =========================
+# Drive folder helpers
+# =========================
+def drive_service(creds: Credentials):
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+def ensure_folder(drive, name: str, parent_id: Optional[str] = None) -> str:
+    # Escape single quotes for Drive query
+    safe_name = name.replace("'", "\\'")
+
+    q = [
+        "mimeType='application/vnd.google-apps.folder'",
+        f"name='{safe_name}'",
+        "trashed=false"
+    ]
+    if parent_id:
+        q.append(f"'{parent_id}' in parents")
+    q = " and ".join(q)
+
+    res = drive.files().list(q=q, fields="files(id,name)", pageSize=10).execute()
+    files = res.get("files", [])
+    if files:
+        return files[0]["id"]
+
+    body = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
+    if parent_id:
+        body["parents"] = [parent_id]
+
+    folder = drive.files().create(body=body, fields="id").execute()
+    return folder["id"]
+
+# =========================
+# Handlers
+# =========================
+@dp.message_handler(commands=["start"])
+async def cmd_start(msg: types.Message):
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton("🔗 ربط Google Drive", callback_data="drive_setup"),
+        InlineKeyboardButton("ℹ️ معلومات", callback_data="info")
+    )
+    await msg.answer(
+        "👋 هلا فيك!\n\n"
+        "هذا بوت أرشفة:\n"
+        "يحفظ الملفات/الوسائط من القروب\n"
+        "ويرفعها إلى Google Drive.\n\n"
+        "ابدأ بربط حسابك (بدون ما نطلب إيميل):",
+        reply_markup=kb
+    )
+
+@dp.callback_query_handler(lambda c: c.data == "info")
+async def info(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.edit_text(
+        "<b>كيف تشتغل الخدمة؟</b>\n\n"
+        "1) اربط Google Drive من الخاص\n"
+        "2) ضيف البوت للقروب (وخله Admin أو عطّل privacy)\n"
+        "3) عشان ترفع ملف: سوّي Reply على الملف داخل القروب واكتب /archive\n\n"
+        "✅ بعدها أي ملف ترد عليه بـ /archive بيرتفع للدرايف داخل فولدر القروب."
+    )
+
+@dp.callback_query_handler(lambda c: c.data == "drive_setup")
+async def drive_setup(call: types.CallbackQuery):
+    await call.answer()
+
+    try:
+        flow = await google_start_device_flow()
+        user_code = flow["user_code"]
+        verification_url = flow.get("verification_url") or flow.get("verification_uri")
+        device_code = flow["device_code"]
+        interval = int(flow.get("interval", 5))
+
+        # نخزن device_code مؤقتًا داخل الرسالة via state
+        state = uuid.uuid4().hex
+        tmp_path = os.path.join(DATA_DIR, f"pending_{state}.json")
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "device_code": device_code,
+                    "interval": interval,
+                    "user_id": call.from_user.id,
+                    "ts": int(time.time())
+                },
+                f,
+                ensure_ascii=False
+            )
+
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton("🔗 افتح صفحة الربط", url=verification_url),
+            InlineKeyboardButton("✅ أدخلت الكود (تحقق)", callback_data=f"drive_verify:{state}"),
+            InlineKeyboardButton("↩️ رجوع", callback_data="back")
+        )
+
+        await call.message.edit_text(
+            "<b>🔗 ربط Google Drive</b>\n\n"
+            f"1) اضغط <b>افتح صفحة الربط</b>\n"
+            f"2) أدخل الكود هذا: <code>{user_code}</code>\n"
+            "3) اختر حسابك ووافق\n"
+            "4) ارجع واضغط <b>تحقق</b>\n\n"
+            "⚠️ ما نطلب منك إيميل داخل البوت.",
+            reply_markup=kb
+        )
+
+    except Exception as e:
+        log.exception("Drive setup failed")
+        await call.message.edit_text(f"❌ ما قدرت أبدأ الربط الآن.\n\n<code>{e}</code>")
+
+@dp.callback_query_handler(lambda c: c.data.startswith("drive_verify:"))
+async def drive_verify(call: types.CallbackQuery):
+    await call.answer()
+    state = call.data.split(":", 1)[1]
+    tmp_path = os.path.join(DATA_DIR, f"pending_{state}.json")
+
+    if not os.path.exists(tmp_path):
+        await call.message.edit_text("❌ جلسة الربط انتهت. اضغط ربط مرة ثانية.")
+        return
+
+    try:
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            pending = json.load(f)
+
+        if pending.get("user_id") != call.from_user.id:
+            await call.answer("هذا الزر مو لك.", show_alert=True)
+            return
+
+        token = await google_poll_token(
+            device_code=pending["device_code"],
+            interval=int(pending.get("interval", 5)),
+            timeout_sec=300
+        )
+
+        creds = Credentials(
+            token=token.get("access_token"),
+            refresh_token=token.get("refresh_token"),
+            token_uri=GOOGLE_TOKEN_URL,
+            client_id=_read_client_secret().get("client_id"),
+            client_secret=_read_client_secret().get("client_secret"),
+            scopes=["https://www.googleapis.com/auth/drive.file"],
+        )
+
+        save_creds(call.from_user.id, creds)
+
+        # cleanup
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+        await call.message.edit_text("✅ تم ربط Google Drive بنجاح! جاهزين للأرشفة داخل القروب.\n\n"
+                                     "📌 داخل القروب: رد على ملف واكتب /archive")
+
+    except Exception as e:
+        log.exception("Drive verify failed")
+        await call.message.edit_text(f"❌ ما قدرت أتحقق من الربط.\n\n<code>{e}</code>")
+
+@dp.callback_query_handler(lambda c: c.data == "back")
+async def back(call: types.CallbackQuery):
+    await call.answer()
+    await cmd_start(call.message)
+
+# =========================
+# Archive command
+# =========================
+@dp.message_handler(commands=["archive"])
+async def archive_cmd(msg: types.Message):
+    # لازم يكون Reply على رسالة فيها ملف/صورة/فيديو
+    if not msg.reply_to_message:
+        await msg.reply("❌ لازم ترد على رسالة فيها ملف/صورة/فيديو ثم اكتب /archive.")
+        return
+
+    # نستخدم ربط نفس المستخدم اللي كتب الأمر
+    user_id = msg.from_user.id
+    creds = ensure_valid_creds(user_id)
+    if not creds:
+        await msg.reply("❌ حسابك غير مربوط. روح للخاص وسوِّ /start ثم اربط Google Drive.")
+        return
+
+    drive = drive_service(creds)
+
+    # فولدر رئيسي + فولدر القروب
+    root_folder_id = ensure_folder(drive, "SetupBridge")
+    chat_title = (msg.chat.title or "Private").strip()
+    chat_folder_name = f"{chat_title} ({msg.chat.id})"
+    chat_folder_id = ensure_folder(drive, chat_folder_name, parent_id=root_folder_id)
+
+    m = msg.reply_to_message
+
+    tg_file = None
+    file_name = None
+
+    # document
+    if m.document:
+        tg_file = m.document
+        file_name = tg_file.file_name or f"document_{tg_file.file_id}"
+    # photo
+    elif m.photo:
+        tg_file = m.photo[-1]
+        file_name = f"photo_{tg_file.file_id}.jpg"
+    # video
+    elif m.video:
+        tg_file = m.video
+        file_name = tg_file.file_name or f"video_{tg_file.file_id}.mp4"
+    else:
+        await msg.reply("❌ نوع الملف غير مدعوم حاليًا. (يدعم: document/photo/video)")
+        return
+
+    # download from TG
+    try:
+        tgf = await bot.get_file(tg_file.file_id)
+        file_path = tgf.file_path
+        file_bytes = await bot.download_file(file_path)
+
+        tmp_dir = "tmp"
+        os.makedirs(tmp_dir, exist_ok=True)
+        local_path = os.path.join(tmp_dir, file_name)
+
+        with open(local_path, "wb") as f:
+            f.write(file_bytes.read())
+
+        await msg.reply("⏳ جاري الرفع إلى Google Drive...")
+
+        media = MediaFileUpload(local_path, resumable=True)
+        created = drive.files().create(
+            body={"name": file_name, "parents": [chat_folder_id]},
+            media_body=media,
+            fields="id, webViewLink"
+        ).execute()
+
+        # cleanup
+        try:
+            os.remove(local_path)
+        except Exception:
+            pass
+
+        link = created.get("webViewLink") or ""
+        if link:
+            await msg.reply(f"✅ تم رفع الملف بنجاح!\n<a href=\"{link}\">فتح الملف في Drive</a>")
+        else:
+            await msg.reply("✅ تم رفع الملف إلى Google Drive بنجاح!")
+
+    except Exception as e:
+        log.exception("Archive failed")
+        await msg.reply(f"❌ فشل رفع الملف.\n\n<code>{e}</code>")
+
+# =========================
+# Run (مع إعادة تشغيل تلقائية)
+# =========================
+async def on_startup(_):
+    log.info("Bot started")
+
+def run_forever():
+    while True:
+        try:
+            executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+        except (NetworkError, RetryAfter, TelegramAPIError) as e:
+            log.warning(f"Polling error, restarting: {e}")
+            time.sleep(3)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            log.exception(f"Fatal error, restarting: {e}")
+            time.sleep(3)
+
+if __name__ == "__main__":
+    run_forever()

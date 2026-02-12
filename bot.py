@@ -1,548 +1,738 @@
-# bot.py
-# Telegram -> Google Drive Archiver (Termux friendly)
-# aiogram v2.x
-
+# -*- coding: utf-8 -*-
 import os
-import json
-import re
-import asyncio
-from datetime import datetime, timezone
+import uuid
+import logging
+from typing import Any, Dict, Optional, List
 
-from aiogram import Bot, Dispatcher, executor, types
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils import executor
 
 from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from google.auth.exceptions import RefreshError
-from google_auth_oauthlib.flow import InstalledAppFlow
 
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from config import (
+    BOT_TOKEN, APP_NAME, GOOGLE_CLIENT_SECRET_FILE, GOOGLE_SCOPES,
+    STATE_PATH, TMP_DIR, DEFAULT_KEYWORDS,
+    FOLDER_PHOTOS, FOLDER_VIDEOS, FOLDER_DOCS, FOLDER_AUDIO, FOLDER_VOICE, FOLDER_STICKERS, FOLDER_OTHER, FOLDER_TEXTS
+)
+from storage import Storage
+from i18n import t
+from utils import sanitize_name, now_iso
+from google_device_flow import start_device_flow, poll_device_flow_token
+from drive_api import drive_service, ensure_folder, upload_file
+from sheets_api import create_sheet_in_drive_folder, append_row
+from tg_media import download_telegram_file
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+log = logging.getLogger("setupbridge")
 
-# =======================
-# CONFIG
-# =======================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing. Export it first: export BOT_TOKEN=xxxxx")
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-TOKENS_DIR = os.path.join(DATA_DIR, "tokens")
-TMP_DIR = os.path.join(DATA_DIR, "tmp")
-STORAGE_PATH = os.path.join(DATA_DIR, "storage.json")
-CLIENT_SECRET_PATH = os.path.join(BASE_DIR, "client_secret.json")
-
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(TOKENS_DIR, exist_ok=True)
-os.makedirs(TMP_DIR, exist_ok=True)
-
-# IMPORTANT: union of scopes we will ever need
-SCOPES = [
-    "https://www.googleapis.com/auth/drive.file",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
-
-DRIVE_ROOT_FOLDER_NAME = "TG Archive"   # top folder in Drive
-
-
-# =======================
-# HELPERS: storage
-# =======================
-def load_storage() -> dict:
-    if not os.path.exists(STORAGE_PATH):
-        return {}
-    try:
-        with open(STORAGE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_storage(data: dict) -> None:
-    with open(STORAGE_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def chat_key(chat_id: int) -> str:
-    return str(chat_id)
-
-
-def token_path_for_chat(chat_id: int) -> str:
-    return os.path.join(TOKENS_DIR, f"token_{chat_id}.json")
-
-
-# =======================
-# HELPERS: google auth
-# =======================
-_pending_flows = {}  # chat_id -> flow
-
-
-def build_flow() -> InstalledAppFlow:
-    if not os.path.exists(CLIENT_SECRET_PATH):
-        raise FileNotFoundError("client_secret.json is missing in project folder.")
-    flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_PATH, SCOPES)
-    # Termux friendly (manual code). This is classic OOB.
-    flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
-    return flow
-
-
-def creds_from_file(path: str) -> Credentials | None:
-    if not os.path.exists(path):
-        return None
-    try:
-        return Credentials.from_authorized_user_file(path, SCOPES)
-    except Exception:
-        return None
-
-
-def save_creds(creds: Credentials, path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(creds.to_json())
-
-
-def get_creds(chat_id: int) -> Credentials | None:
-    path = token_path_for_chat(chat_id)
-    creds = creds_from_file(path)
-    if not creds:
-        return None
-
-    # refresh if needed
-    if creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-            save_creds(creds, path)
-        except RefreshError:
-            # likely invalid_scope / revoked / etc.
-            return None
-    return creds
-
-
-def google_services(creds: Credentials):
-    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
-    sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
-    return drive, sheets
-
-
-# =======================
-# HELPERS: Drive
-# =======================
-def escape_drive_q_value(value: str) -> str:
-    # escape backslash + single quotes for Drive query string
-    v = value.replace("\\", "\\\\")
-    v = v.replace("'", "\\'")
-    return v
-
-
-def find_folder(drive, name: str, parent_id: str | None = None) -> str | None:
-    esc = escape_drive_q_value(name)
-    q = "mimeType='application/vnd.google-apps.folder' and trashed=false"
-    q += f" and name='{esc}'"
-    if parent_id:
-        q += f" and '{parent_id}' in parents"
-
-    res = drive.files().list(
-        q=q,
-        spaces="drive",
-        fields="files(id,name)",
-        pageSize=10
-    ).execute()
-
-    files = res.get("files", [])
-    return files[0]["id"] if files else None
-
-
-def create_folder(drive, name: str, parent_id: str | None = None) -> str:
-    metadata = {
-        "name": name,
-        "mimeType": "application/vnd.google-apps.folder",
-    }
-    if parent_id:
-        metadata["parents"] = [parent_id]
-
-    f = drive.files().create(body=metadata, fields="id").execute()
-    return f["id"]
-
-
-def ensure_folder(drive, name: str, parent_id: str | None = None) -> str:
-    fid = find_folder(drive, name, parent_id)
-    if fid:
-        return fid
-    return create_folder(drive, name, parent_id)
-
-
-def upload_file(drive, folder_id: str, local_path: str, drive_name: str, mime_type: str | None = None) -> tuple[str, str]:
-    body = {"name": drive_name, "parents": [folder_id]}
-    media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
-    f = drive.files().create(body=body, media_body=media, fields="id,webViewLink").execute()
-    return f["id"], f.get("webViewLink", "")
-
-
-def ensure_spreadsheet(drive, folder_id: str, title: str = "Archive") -> tuple[str, str]:
-    # Search for existing spreadsheet in folder
-    esc = escape_drive_q_value(title)
-    q = "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-    q += f" and name='{esc}' and '{folder_id}' in parents"
-
-    res = drive.files().list(q=q, spaces="drive", fields="files(id,name)").execute()
-    files = res.get("files", [])
-    if files:
-        sid = files[0]["id"]
-        return sid, f"https://docs.google.com/spreadsheets/d/{sid}/edit"
-
-    meta = {
-        "name": title,
-        "mimeType": "application/vnd.google-apps.spreadsheet",
-        "parents": [folder_id],
-    }
-    f = drive.files().create(body=meta, fields="id").execute()
-    sid = f["id"]
-    return sid, f"https://docs.google.com/spreadsheets/d/{sid}/edit"
-
-
-# =======================
-# HELPERS: Sheets
-# =======================
-def ensure_header_row(sheets, spreadsheet_id: str):
-    # Create headers if sheet is empty
-    # We'll just append header if A1 is empty.
-    try:
-        r = sheets.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range="A1:A1"
-        ).execute()
-        values = r.get("values", [])
-        if values and values[0] and values[0][0].strip():
-            return
-    except Exception:
-        pass
-
-    header = [[
-        "timestamp",
-        "chat_id",
-        "chat_title",
-        "from_id",
-        "from_name",
-        "message_id",
-        "text"
-    ]]
-    sheets.spreadsheets().values().append(
-        spreadsheetId=spreadsheet_id,
-        range="A1",
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": header}
-    ).execute()
-
-
-def append_text_row(sheets, spreadsheet_id: str, row: list[str]):
-    sheets.spreadsheets().values().append(
-        spreadsheetId=spreadsheet_id,
-        range="A1",
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": [row]}
-    ).execute()
-
-
-# =======================
-# BOT
-# =======================
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
+store = Storage(STATE_PATH)
+
+# in-memory device flows: user_id -> flow dict
+DEVICE_FLOWS: Dict[int, Dict[str, Any]] = {}
 
 
-def is_archive_command(text: str) -> bool:
-    if not text:
-        return False
-    t = text.strip().lower()
-    # allow /archive, archive, أرشف, ارشف, أرشفة, ارشفة
-    return t in {"/archive", "archive", "أرشف", "ارشف", "أرشفة", "ارشفة", "أرشيف", "ارشيف"}
+def _lang_for(user_id: int) -> str:
+    return store.get_user_lang(user_id)
 
 
-@dp.message_handler(commands=["start", "help"])
-async def start_help(message: types.Message):
-    msg = (
-        "👋 هلا! أنا بوت الأرشفة.\n\n"
-        "✅ الأوامر:\n"
-        "• /setup  → ربط Google Drive (أول مرة)\n"
-        "• /code CODE → لصق كود الربط بعد ما تفتح الرابط\n"
-        "• /archive → (ردّ على رسالة) لحفظها\n\n"
-        "ملاحظة: النصوص تنحفظ في Google Sheet واحد، والوسائط تنرفع لملفات photos/videos/documents."
+def _is_private(msg: types.Message) -> bool:
+    return msg.chat.type == types.ChatType.PRIVATE
+
+
+def _is_group(msg: types.Message) -> bool:
+    return msg.chat.type in (types.ChatType.GROUP, types.ChatType.SUPERGROUP)
+
+
+def kb_home(lang: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton(t(lang, "btn_group_settings"), callback_data="menu:group_settings"),
+        InlineKeyboardButton(t(lang, "btn_info"), callback_data="menu:info"),
+        InlineKeyboardButton(t(lang, "btn_lang"), callback_data="menu:lang"),
     )
-    await message.reply(msg)
+    return kb
+
+
+def kb_back(lang: str, to: str = "menu:home") -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(t(lang, "btn_back"), callback_data=to))
+    return kb
+
+
+def kb_lang(lang: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton(t(lang, "lang_ar"), callback_data="lang:ar"),
+        InlineKeyboardButton(t(lang, "lang_en"), callback_data="lang:en"),
+    )
+    kb.add(InlineKeyboardButton(t(lang, "btn_back"), callback_data="menu:home"))
+    return kb
+
+
+def _get_user_creds(user_id: int) -> Optional[Credentials]:
+    creds_file = store.get_user_creds_file(user_id)
+    if not creds_file or not os.path.exists(creds_file):
+        return None
+    try:
+        return Credentials.from_authorized_user_file(creds_file, scopes=GOOGLE_SCOPES)
+    except Exception:
+        return None
+
+
+def _save_user_creds(user_id: int, token_json: Dict[str, Any]) -> str:
+    os.makedirs("data", exist_ok=True)
+    path = f"data/creds_{user_id}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        import json
+        json.dump(token_json, f, ensure_ascii=False, indent=2)
+    store.set_user_creds(user_id, path, email=None)
+    return path
+
+
+def _pending_group_for(user_id: int) -> Optional[int]:
+    pend = store.data.get("pending", {}).get(str(user_id))
+    if isinstance(pend, dict) and pend.get("chat_id"):
+        try:
+            return int(pend["chat_id"])
+        except Exception:
+            return None
+    return None
+
+
+def _ensure_group_structure(creds: Credentials, chat_id: int, chat_title: str) -> Dict[str, Any]:
+    g = store.get_group(chat_id)
+
+    # must have drive user set
+    drive_user_id = g.get("drive_user_id")
+    if not drive_user_id:
+        g["drive_user_id"] = None
+        store.set_group(chat_id, g)
+        return g
+
+    # build drive
+    drive = drive_service(creds)
+
+    # root folder
+    if not g.get("root_folder_id"):
+        root_name = f"{APP_NAME} - {sanitize_name(chat_title, str(chat_id))}"
+        g["root_folder_id"] = ensure_folder(drive, root_name, None)
+
+    # type folders
+    folders = g.get("folders", {})
+    if not isinstance(folders, dict):
+        folders = {}
+    mapping = {
+        "photos": FOLDER_PHOTOS,
+        "videos": FOLDER_VIDEOS,
+        "docs": FOLDER_DOCS,
+        "audio": FOLDER_AUDIO,
+        "voice": FOLDER_VOICE,
+        "stickers": FOLDER_STICKERS,
+        "other": FOLDER_OTHER,
+    }
+    for k, nm in mapping.items():
+        if not folders.get(k):
+            folders[k] = ensure_folder(drive, nm, g["root_folder_id"])
+    g["folders"] = folders
+
+    # sheet for texts
+    if not g.get("sheet_id"):
+        sheet_title = f"{FOLDER_TEXTS} - {sanitize_name(chat_title, str(chat_id))}"
+        g["sheet_id"] = create_sheet_in_drive_folder(creds, drive, g["root_folder_id"], sheet_title)
+
+    store.set_group(chat_id, g)
+    return g
+
+
+@dp.message_handler(commands=["start"])
+async def cmd_start(msg: types.Message):
+    lang = _lang_for(msg.from_user.id)
+    if not _is_private(msg):
+        # ignore in groups to avoid noise
+        return
+
+    text = "\n".join([
+        f"<b>{t(lang, 'welcome_title')}</b>",
+        t(lang, "welcome_brief", app=APP_NAME),
+        "",
+        f"<b>{t(lang, 'how_to')}</b>",
+        t(lang, "step1"),
+        t(lang, "step2"),
+        t(lang, "step3"),
+        t(lang, "step4"),
+    ])
+    await msg.answer(text, reply_markup=kb_home(lang))
 
 
 @dp.message_handler(commands=["setup"])
-async def setup_cmd(message: types.Message):
-    chat_id = message.chat.id
+async def cmd_setup(msg: types.Message):
+    lang = _lang_for(msg.from_user.id)
 
-    # If already has valid creds, just ensure folders/sheet
-    creds = get_creds(chat_id)
-    if creds:
-        drive, sheets = google_services(creds)
-        storage = load_storage()
-        ck = chat_key(chat_id)
-        storage.setdefault(ck, {})
-
-        root_id = ensure_folder(drive, DRIVE_ROOT_FOLDER_NAME)
-        chat_folder_id = ensure_folder(drive, f"Chat_{chat_id}", root_id)
-
-        # subfolders for media
-        photos_id = ensure_folder(drive, "photos", chat_folder_id)
-        videos_id = ensure_folder(drive, "videos", chat_folder_id)
-        docs_id = ensure_folder(drive, "documents", chat_folder_id)
-
-        sheet_id, sheet_link = ensure_spreadsheet(drive, chat_folder_id, "Archive")
-        ensure_header_row(sheets, sheet_id)
-
-        storage[ck].update({
-            "root_id": root_id,
-            "chat_folder_id": chat_folder_id,
-            "photos_id": photos_id,
-            "videos_id": videos_id,
-            "docs_id": docs_id,
-            "sheet_id": sheet_id,
-        })
-        save_storage(storage)
-
-        await message.reply(
-            "✅ Google Drive مرتبط بالفعل.\n"
-            f"📄 جدول النصوص: {sheet_link}"
-        )
+    if not _is_group(msg):
+        await msg.reply(t(lang, "only_groups"))
         return
 
-    # Start auth flow (Termux friendly)
+    member = await bot.get_chat_member(msg.chat.id, msg.from_user.id)
+    if member.status not in ("administrator", "creator"):
+        await msg.reply(t(lang, "need_admin"))
+        return
+
+    # Save pending mapping: user -> chat
+    store.set_pending(msg.from_user.id, msg.chat.id)
+
+    # Send as BUTTON (not plain link)
+    deep = f"https://t.me/{(await bot.me).username}?start=setup_{msg.chat.id}"
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(t(lang, "open_private_btn"), url=deep))
+    await msg.reply(t(lang, "setup_ready"), reply_markup=kb)
+
+
+@dp.message_handler(lambda m: _is_private(m) and m.text and m.text.startswith("/start setup_"))
+async def cmd_start_setup_private(msg: types.Message):
+    lang = _lang_for(msg.from_user.id)
+    # parse chat_id from /start setup_<id>
     try:
-        flow = build_flow()
-        auth_url, _ = flow.authorization_url(
-            access_type="offline",
-            prompt="consent",
-            include_granted_scopes="true",
-        )
-        _pending_flows[chat_id] = flow
-        await message.reply(
-            "🔗 افتح الرابط هذا وسجّل دخولك ثم انسخ CODE:\n"
-            f"{auth_url}\n\n"
-            "بعدها أرسل:\n"
-            "/code CODE"
-        )
-    except Exception as e:
-        await message.reply(f"❌ فشل /setup: {e}")
-
-
-@dp.message_handler(commands=["code"])
-async def code_cmd(message: types.Message):
-    chat_id = message.chat.id
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply("اكتبها كذا: /code CODE")
+        payload = msg.text.split("setup_", 1)[1].strip()
+        chat_id = int(payload)
+    except Exception:
+        await msg.answer(t(lang, "pending_not_found"))
         return
 
-    code = parts[1].strip()
-    flow = _pending_flows.get(chat_id)
-    if not flow:
-        # allow creating new flow if bot restarted
-        flow = build_flow()
-
-    try:
-        flow.fetch_token(code=code)
-        creds = flow.credentials
-        save_creds(creds, token_path_for_chat(chat_id))
-        _pending_flows.pop(chat_id, None)
-
-        # Ensure folders and sheet now
-        drive, sheets = google_services(creds)
-        storage = load_storage()
-        ck = chat_key(chat_id)
-        storage.setdefault(ck, {})
-
-        root_id = ensure_folder(drive, DRIVE_ROOT_FOLDER_NAME)
-        chat_folder_id = ensure_folder(drive, f"Chat_{chat_id}", root_id)
-
-        photos_id = ensure_folder(drive, "photos", chat_folder_id)
-        videos_id = ensure_folder(drive, "videos", chat_folder_id)
-        docs_id = ensure_folder(drive, "documents", chat_folder_id)
-
-        sheet_id, sheet_link = ensure_spreadsheet(drive, chat_folder_id, "Archive")
-        ensure_header_row(sheets, sheet_id)
-
-        storage[ck].update({
-            "root_id": root_id,
-            "chat_folder_id": chat_folder_id,
-            "photos_id": photos_id,
-            "videos_id": videos_id,
-            "docs_id": docs_id,
-            "sheet_id": sheet_id,
-        })
-        save_storage(storage)
-
-        await message.reply(
-            "✅ تم ربط Google Drive بنجاح!\n"
-            f"📄 جدول النصوص: {sheet_link}"
-        )
-
-    except Exception as e:
-        await message.reply(f"❌ فشل الربط: {e}\nجرّب /setup من جديد.")
+    store.set_pending(msg.from_user.id, chat_id)
+    await show_group_settings(msg.from_user.id, msg.chat.id, edit_message_id=None)
 
 
-async def ensure_ready(message: types.Message) -> tuple[Credentials | None, dict | None, str | None]:
-    """Return creds, storage_for_chat, error_message"""
-    chat_id = message.chat.id
-    creds = get_creds(chat_id)
-    if not creds:
-        return None, None, "لازم تسوي /setup أول (أو التوكن انتهى)."
-
-    storage = load_storage()
-    ck = chat_key(chat_id)
-    if ck not in storage or "chat_folder_id" not in storage[ck] or "sheet_id" not in storage[ck]:
-        # rebuild folders/sheet
-        drive, sheets = google_services(creds)
-        root_id = ensure_folder(drive, DRIVE_ROOT_FOLDER_NAME)
-        chat_folder_id = ensure_folder(drive, f"Chat_{chat_id}", root_id)
-        photos_id = ensure_folder(drive, "photos", chat_folder_id)
-        videos_id = ensure_folder(drive, "videos", chat_folder_id)
-        docs_id = ensure_folder(drive, "documents", chat_folder_id)
-        sheet_id, _ = ensure_spreadsheet(drive, chat_folder_id, "Archive")
-        ensure_header_row(sheets, sheet_id)
-
-        storage.setdefault(ck, {})
-        storage[ck].update({
-            "root_id": root_id,
-            "chat_folder_id": chat_folder_id,
-            "photos_id": photos_id,
-            "videos_id": videos_id,
-            "docs_id": docs_id,
-            "sheet_id": sheet_id,
-        })
-        save_storage(storage)
-
-    return creds, storage[ck], None
-
-
-@dp.message_handler(lambda m: m.text and is_archive_command(m.text))
-async def archive_cmd(message: types.Message):
-    # must be reply
-    if not message.reply_to_message:
-        await message.reply("لازم ترد (Reply) على الرسالة وبعدين اكتب /archive")
+async def show_group_settings(user_id: int, private_chat_id: int, edit_message_id: Optional[int]):
+    lang = _lang_for(user_id)
+    chat_id = _pending_group_for(user_id)
+    if not chat_id:
+        await bot.send_message(private_chat_id, t(lang, "pending_not_found"))
         return
 
-    status_msg = await message.reply("⏳ جاري الأرشفة...")
+    chat = await bot.get_chat(chat_id)
+    g = store.get_group(chat_id)
 
-    creds, st, err = await ensure_ready(message)
-    if err:
-        await status_msg.edit_text(f"❌ {err}")
+    linked = bool(g.get("drive_user_id"))
+    enabled = bool(g.get("enabled", True))
+
+    text = "\n".join([
+        f"<b>{t(lang,'group_settings_title')}</b>",
+        "",
+        t(lang, "status_group",
+          title=sanitize_name(chat.title or str(chat_id), str(chat_id)),
+          drive=t(lang, "drive_linked") if linked else t(lang, "drive_not_linked"),
+          arch=t(lang, "arch_on") if enabled else t(lang, "arch_off")),
+    ])
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    if linked:
+        kb.add(InlineKeyboardButton(t(lang, "btn_drive_unlink"), callback_data="drive:unlink"))
+    else:
+        kb.add(InlineKeyboardButton(t(lang, "btn_drive_link"), callback_data="drive:link"))
+
+    kb.add(
+        InlineKeyboardButton(t(lang, "btn_toggle_arch"), callback_data="group:toggle_arch"),
+        InlineKeyboardButton(t(lang, "btn_choose_folder"), callback_data="group:ensure_folders"),
+        InlineKeyboardButton(t(lang, "btn_advanced"), callback_data="menu:advanced"),
+        InlineKeyboardButton(t(lang, "btn_back"), callback_data="menu:home"),
+    )
+
+    if edit_message_id:
+        await bot.edit_message_text(text, private_chat_id, edit_message_id, reply_markup=kb)
+    else:
+        await bot.send_message(private_chat_id, text, reply_markup=kb)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("menu:"))
+async def menu_handler(call: types.CallbackQuery):
+    lang = _lang_for(call.from_user.id)
+    if call.message.chat.type != types.ChatType.PRIVATE:
+        await call.answer(t(lang, "only_private"), show_alert=True)
         return
 
-    chat_id = message.chat.id
-    try:
-        drive, sheets = google_services(creds)
+    action = call.data.split(":", 1)[1]
 
-        src = message.reply_to_message
-        chat_title = message.chat.title or ""
-        from_user = src.from_user
-        from_id = str(from_user.id) if from_user else ""
-        from_name = ""
-        if from_user:
-            from_name = (from_user.full_name or "").strip()
+    if action == "home":
+        text = "\n".join([
+            f"<b>{t(lang, 'welcome_title')}</b>",
+            t(lang, "welcome_brief", app=APP_NAME),
+            "",
+            f"<b>{t(lang, 'how_to')}</b>",
+            t(lang, "step1"),
+            t(lang, "step2"),
+            t(lang, "step3"),
+            t(lang, "step4"),
+        ])
+        await call.message.edit_text(text, reply_markup=kb_home(lang))
+        await call.answer()
+        return
 
-        # timestamp ISO
-        ts = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    if action == "info":
+        text = "\n".join([
+            f"<b>{APP_NAME}</b>",
+            t(lang, "welcome_brief", app=APP_NAME),
+            "",
+            t(lang, "step2"),
+            t(lang, "step3"),
+            t(lang, "step4"),
+        ])
+        await call.message.edit_text(text, reply_markup=kb_back(lang))
+        await call.answer()
+        return
 
-        # 1) TEXT
-        if src.text or src.caption:
-            text_value = src.text if src.text else src.caption
-            text_value = text_value.strip()
+    if action == "lang":
+        await call.message.edit_text(t(lang, "choose_lang"), reply_markup=kb_lang(lang))
+        await call.answer()
+        return
 
-            ensure_header_row(sheets, st["sheet_id"])
-            row = [
-                ts,
-                str(chat_id),
-                chat_title,
-                from_id,
-                from_name,
-                str(src.message_id),
-                text_value
-            ]
-            append_text_row(sheets, st["sheet_id"], row)
-            sheet_link = f"https://docs.google.com/spreadsheets/d/{st['sheet_id']}/edit"
-            await status_msg.edit_text(f"✅ تم حفظ النص في الجدول.\n📄 {sheet_link}")
+    if action == "group_settings":
+        await show_group_settings(call.from_user.id, call.message.chat.id, call.message.message_id)
+        await call.answer()
+        return
+
+    if action == "advanced":
+        await show_advanced(call)
+        return
+
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("lang:"))
+async def lang_handler(call: types.CallbackQuery):
+    lang_new = call.data.split(":", 1)[1]
+    store.set_user_lang(call.from_user.id, lang_new)
+    lang = _lang_for(call.from_user.id)
+    await call.message.edit_text(t(lang, "saved"), reply_markup=kb_home(lang))
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data in ("group:toggle_arch", "group:ensure_folders"))
+async def group_actions(call: types.CallbackQuery):
+    lang = _lang_for(call.from_user.id)
+    chat_id = _pending_group_for(call.from_user.id)
+    if not chat_id:
+        await call.answer(t(lang, "pending_not_found"), show_alert=True)
+        return
+
+    g = store.get_group(chat_id)
+
+    if call.data == "group:toggle_arch":
+        g["enabled"] = not bool(g.get("enabled", True))
+        store.set_group(chat_id, g)
+        await show_group_settings(call.from_user.id, call.message.chat.id, call.message.message_id)
+        await call.answer()
+        return
+
+    if call.data == "group:ensure_folders":
+        if not g.get("drive_user_id"):
+            await call.answer(t(lang, "drive_not_linked"), show_alert=True)
             return
-
-        # 2) PHOTO
-        if src.photo:
-            photo = src.photo[-1]  # best quality
-            file_info = await bot.get_file(photo.file_id)
-            local_path = os.path.join(TMP_DIR, f"photo_{src.message_id}.jpg")
-            await bot.download_file(file_info.file_path, local_path)
-
-            drive_name = f"photos_file_{src.message_id}.jpg"
-            _, link = upload_file(drive, st["photos_id"], local_path, drive_name, "image/jpeg")
-            try:
-                os.remove(local_path)
-            except Exception:
-                pass
-
-            await status_msg.edit_text(f"✅ تم رفع الصورة.\n🔗 {link}")
+        creds = _get_user_creds(int(g["drive_user_id"]))
+        if not creds:
+            await call.answer(t(lang, "drive_not_linked"), show_alert=True)
             return
+        chat = await bot.get_chat(chat_id)
+        _ensure_group_structure(creds, chat_id, chat.title or str(chat_id))
+        await show_group_settings(call.from_user.id, call.message.chat.id, call.message.message_id)
+        await call.answer(t(lang, "saved"), show_alert=False)
+        return
 
-        # 3) VIDEO
-        if src.video:
-            v = src.video
-            file_info = await bot.get_file(v.file_id)
-            ext = ".mp4"
-            local_path = os.path.join(TMP_DIR, f"video_{src.message_id}{ext}")
-            await bot.download_file(file_info.file_path, local_path)
 
-            drive_name = f"videos_file_{src.message_id}{ext}"
-            _, link = upload_file(drive, st["videos_id"], local_path, drive_name, "video/mp4")
-            try:
-                os.remove(local_path)
-            except Exception:
-                pass
+async def show_advanced(call: types.CallbackQuery):
+    lang = _lang_for(call.from_user.id)
+    chat_id = _pending_group_for(call.from_user.id)
+    if not chat_id:
+        await call.answer(t(lang, "pending_not_found"), show_alert=True)
+        return
 
-            await status_msg.edit_text(f"✅ تم رفع الفيديو.\n🔗 {link}")
-            return
+    g = store.get_group(chat_id)
+    mode = g.get("mode", "reply")
+    auto = g.get("auto", {}) if isinstance(g.get("auto"), dict) else {"enabled": False, "notify_interval_h": 6}
+    kw = g.get("keywords") or DEFAULT_KEYWORDS
+    kw_s = ", ".join(kw)
 
-        # 4) DOCUMENT (pdf, zip, etc)
-        if src.document:
-            d = src.document
-            file_info = await bot.get_file(d.file_id)
-            # keep original filename when possible
-            orig = d.file_name or f"document_{src.message_id}"
-            safe_orig = re.sub(r"[^\w\-. ()\[\]]+", "_", orig)
-            local_path = os.path.join(TMP_DIR, f"{src.message_id}_{safe_orig}")
-            await bot.download_file(file_info.file_path, local_path)
+    text = "\n".join([
+        f"<b>{t(lang,'advanced_title')}</b>",
+        "",
+        t(lang, "adv_status",
+          mode=t(lang, "mode_auto") if mode == "auto" else t(lang, "mode_reply"),
+          auto=t(lang, "auto_on") if auto.get("enabled") else t(lang, "auto_off"),
+          n=int(auto.get("notify_interval_h") or 6),
+          kw=kw_s),
+    ])
 
-            mime = d.mime_type or "application/octet-stream"
-            drive_name = f"documents_file_{src.message_id}_{safe_orig}"
-            _, link = upload_file(drive, st["docs_id"], local_path, drive_name, mime)
-            try:
-                os.remove(local_path)
-            except Exception:
-                pass
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton(t(lang, "btn_mode_toggle"), callback_data="adv:mode"),
+        InlineKeyboardButton(t(lang, "btn_auto_toggle"), callback_data="adv:auto"),
+        InlineKeyboardButton(t(lang, "btn_notify_interval"), callback_data="adv:interval"),
+        InlineKeyboardButton(t(lang, "btn_keywords"), callback_data="adv:keywords"),
+        InlineKeyboardButton(t(lang, "btn_back"), callback_data="menu:group_settings"),
+    )
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
 
-            await status_msg.edit_text(f"✅ تم رفع المستند.\n🔗 {link}")
-            return
 
-        # fallback
-        await status_msg.edit_text("❌ نوع الرسالة غير مدعوم حالياً (نص/صورة/فيديو/مستند).")
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("adv:"))
+async def adv_handler(call: types.CallbackQuery):
+    lang = _lang_for(call.from_user.id)
+    chat_id = _pending_group_for(call.from_user.id)
+    if not chat_id:
+        await call.answer(t(lang, "pending_not_found"), show_alert=True)
+        return
 
-    except RefreshError as e:
-        # very common with invalid_scope / revoked
-        # delete token and force setup
+    g = store.get_group(chat_id)
+    auto = g.get("auto", {})
+    if not isinstance(auto, dict):
+        auto = {"enabled": False, "notify_interval_h": 6}
+
+    action = call.data.split(":", 1)[1]
+    if action == "mode":
+        g["mode"] = "auto" if g.get("mode") != "auto" else "reply"
+        store.set_group(chat_id, g)
+        await show_advanced(call)
+        return
+
+    if action == "auto":
+        auto["enabled"] = not bool(auto.get("enabled"))
+        g["auto"] = auto
+        store.set_group(chat_id, g)
+        await show_advanced(call)
+        return
+
+    if action == "interval":
+        # ask user to send number
+        await call.message.edit_text("🕒 " + t(lang, "btn_notify_interval") + "\n\n" + "1 - 24",
+                                    reply_markup=kb_back(lang, "menu:advanced"))
+        store.data.setdefault("pending", {})
+        store.data["pending"][str(call.from_user.id)] = {"chat_id": str(chat_id), "await": "interval"}
+        store.save()
+        await call.answer()
+        return
+
+    if action == "keywords":
+        await call.message.edit_text(t(lang, "keywords_help"), reply_markup=kb_back(lang, "menu:advanced"))
+        store.data.setdefault("pending", {})
+        store.data["pending"][str(call.from_user.id)] = {"chat_id": str(chat_id), "await": "keywords"}
+        store.save()
+        await call.answer()
+        return
+
+
+@dp.message_handler(lambda m: _is_private(m) and m.text)
+async def private_text_router(msg: types.Message):
+    lang = _lang_for(msg.from_user.id)
+    pend = store.data.get("pending", {}).get(str(msg.from_user.id))
+    if not isinstance(pend, dict) or "await" not in pend:
+        return
+
+    chat_id = _pending_group_for(msg.from_user.id)
+    if not chat_id:
+        await msg.reply(t(lang, "pending_not_found"))
+        return
+
+    g = store.get_group(chat_id)
+    await_key = pend.get("await")
+
+    if await_key == "interval":
         try:
-            os.remove(token_path_for_chat(chat_id))
+            n = int(msg.text.strip())
+            if not (1 <= n <= 24):
+                raise ValueError()
         except Exception:
-            pass
-        await status_msg.edit_text(
-            "❌ صلاحيات Google انتهت/تغيّرت (invalid_scope غالباً).\n"
-            "حلّها: سوِّ /setup من جديد."
+            await msg.reply(t(lang, "bad_interval"))
+            return
+        auto = g.get("auto", {})
+        if not isinstance(auto, dict):
+            auto = {"enabled": False, "notify_interval_h": 6}
+        auto["notify_interval_h"] = n
+        g["auto"] = auto
+        store.set_group(chat_id, g)
+        pend.pop("await", None)
+        store.data["pending"][str(msg.from_user.id)] = {"chat_id": str(chat_id)}
+        store.save()
+        await msg.reply(t(lang, "saved"), reply_markup=kb_home(lang))
+        return
+
+    if await_key == "keywords":
+        parts = [p.strip() for p in msg.text.split(",")]
+        parts = [p for p in parts if p]
+        g["keywords"] = parts[:20] if parts else None
+        store.set_group(chat_id, g)
+        pend.pop("await", None)
+        store.data["pending"][str(msg.from_user.id)] = {"chat_id": str(chat_id)}
+        store.save()
+        await msg.reply(t(lang, "saved"), reply_markup=kb_home(lang))
+        return
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("drive:"))
+async def drive_menu(call: types.CallbackQuery):
+    lang = _lang_for(call.from_user.id)
+    chat_id = _pending_group_for(call.from_user.id)
+    if not chat_id:
+        await call.answer(t(lang, "pending_not_found"), show_alert=True)
+        return
+    g = store.get_group(chat_id)
+
+    action = call.data.split(":", 1)[1]
+    if action == "unlink":
+        g["drive_user_id"] = None
+        g["root_folder_id"] = None
+        g["folders"] = {}
+        g["sheet_id"] = None
+        store.set_group(chat_id, g)
+        await show_group_settings(call.from_user.id, call.message.chat.id, call.message.message_id)
+        await call.answer(t(lang, "unlink_ok"), show_alert=False)
+        return
+
+    if action == "link":
+        # Start device flow for this user
+        try:
+            flow = await start_device_flow(GOOGLE_CLIENT_SECRET_FILE, GOOGLE_SCOPES)
+            DEVICE_FLOWS[call.from_user.id] = flow
+        except Exception as e:
+            await call.answer(str(e), show_alert=True)
+            return
+
+        code = flow.get("user_code")
+        verification_url = flow.get("verification_url") or flow.get("verification_uri")
+        device_code = flow.get("device_code")
+        interval = int(flow.get("interval") or 5)
+
+        if not (code and verification_url and device_code):
+            await call.answer("device flow response invalid", show_alert=True)
+            return
+
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            InlineKeyboardButton(t(lang, "btn_open_google"), url=verification_url),
+            InlineKeyboardButton(t(lang, "btn_verify"), callback_data="drive:verify"),
+            InlineKeyboardButton(t(lang, "btn_back"), callback_data="menu:group_settings"),
         )
+        await call.message.edit_text(
+            f"<b>{t(lang,'device_code_title')}</b>\n\n" + t(lang, "device_code_body", code=code),
+            reply_markup=kb
+        )
+        await call.answer()
+        return
+
+    if action == "verify":
+        flow = DEVICE_FLOWS.get(call.from_user.id)
+        if not flow:
+            await call.answer(t(lang, "linked_fail"), show_alert=True)
+            return
+        await call.answer(t(lang, "verifying"), show_alert=True)
+
+        try:
+            token = await poll_device_flow_token(
+                GOOGLE_CLIENT_SECRET_FILE,
+                device_code=flow["device_code"],
+                interval=int(flow.get("interval") or 5),
+                timeout_sec=180,
+            )
+        except Exception:
+            await call.answer(t(lang, "linked_fail"), show_alert=True)
+            return
+
+        # save creds for user
+        _save_user_creds(call.from_user.id, token)
+
+        # bind group to this user creds
+        g["drive_user_id"] = call.from_user.id
+        store.set_group(chat_id, g)
+
+        # ensure folders + sheet now
+        creds = _get_user_creds(call.from_user.id)
+        if creds:
+            chat = await bot.get_chat(chat_id)
+            _ensure_group_structure(creds, chat_id, chat.title or str(chat_id))
+
+        await show_group_settings(call.from_user.id, call.message.chat.id, call.message.message_id)
+        await call.answer(t(lang, "linked_ok"), show_alert=True)
+        return
+
+
+def _match_archive_keyword(g: Dict[str, Any], text: str) -> bool:
+    kw = g.get("keywords") or DEFAULT_KEYWORDS
+    text = (text or "").strip().lower()
+    return any(k.lower() == text for k in kw)
+
+
+@dp.message_handler(commands=["archive"])
+async def archive_cmd(msg: types.Message):
+    if not _is_group(msg):
+        return
+    g = store.get_group(msg.chat.id)
+    lang = store.get_user_lang(msg.from_user.id)
+
+    if not g.get("enabled", True):
+        await msg.reply(t(lang, "not_enabled"))
+        return
+
+    if not msg.reply_to_message:
+        await msg.reply(t(lang, "reply_required"))
+        return
+
+    # Need linked drive
+    drive_user_id = g.get("drive_user_id")
+    if not drive_user_id:
+        await msg.reply(t(lang, "drive_not_linked"))
+        return
+    creds = _get_user_creds(int(drive_user_id))
+    if not creds:
+        await msg.reply(t(lang, "drive_not_linked"))
+        return
+
+    try:
+        # ensure structure
+        g = _ensure_group_structure(creds, msg.chat.id, msg.chat.title or str(msg.chat.id))
+        drive = drive_service(creds)
+
+        r = msg.reply_to_message
+        sender = r.from_user.full_name if r.from_user else "Unknown"
+        sender_id = r.from_user.id if r.from_user else ""
+        group_title = msg.chat.title or str(msg.chat.id)
+
+        # TEXT -> append to sheet (NOT folder spam)
+        if r.text or r.caption:
+            text = r.text or r.caption or ""
+            row = [now_iso(), group_title, sender, str(sender_id), str(r.message_id), text]
+            if not g.get("sheet_id"):
+                # create sheet if missing
+                g = _ensure_group_structure(creds, msg.chat.id, group_title)
+            append_row(creds, g["sheet_id"], row)
+
+        # MEDIA -> upload into its folder
+        uploaded_any = False
+
+        async def _upload(file_id: str, folder_key: str, name: str):
+            nonlocal uploaded_any
+            local, mime = await download_telegram_file(bot, file_id, TMP_DIR, name)
+            try:
+                upload_file(drive, local, name, g["folders"][folder_key], mime_type=mime)
+                uploaded_any = True
+            finally:
+                try:
+                    os.remove(local)
+                except Exception:
+                    pass
+
+        if r.photo:
+            p = r.photo[-1]
+            await _upload(p.file_id, "photos", f"photo_{p.file_unique_id}.jpg")
+
+        if r.video:
+            v = r.video
+            await _upload(v.file_id, "videos", f"video_{v.file_unique_id}.mp4")
+
+        if r.document:
+            d = r.document
+            await _upload(d.file_id, "docs", sanitize_name(d.file_name or f"doc_{d.file_unique_id}", "document"))
+
+        if r.audio:
+            a = r.audio
+            await _upload(a.file_id, "audio", sanitize_name(a.file_name or f"audio_{a.file_unique_id}.mp3", "audio"))
+
+        if r.voice:
+            v = r.voice
+            await _upload(v.file_id, "voice", f"voice_{v.file_unique_id}.ogg")
+
+        if r.sticker:
+            s = r.sticker
+            ext = "webp" if s.is_animated is False else "tgs"
+            await _upload(s.file_id, "stickers", f"sticker_{s.file_unique_id}.{ext}")
+
+        # fallback (nothing)
+        await msg.reply(t(lang, "archive_done"))
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ خطأ أثناء الأرشفة: {e}")
+        log.exception("archive failed")
+        await msg.reply(t(lang, "archive_failed", err=str(e)))
+
+
+@dp.message_handler(content_types=types.ContentType.ANY)
+async def auto_archiver(msg: types.Message):
+    # auto mode: archive every incoming message (no reply needed)
+    if not _is_group(msg):
+        return
+    g = store.get_group(msg.chat.id)
+    if not g.get("enabled", True):
+        return
+
+    if g.get("mode") != "auto":
+        return
+    auto = g.get("auto", {})
+    if not isinstance(auto, dict) or not auto.get("enabled"):
+        return
+
+    # do not auto-archive bot commands
+    if msg.text and msg.text.startswith("/"):
+        return
+
+    # Need linked drive
+    drive_user_id = g.get("drive_user_id")
+    if not drive_user_id:
+        return
+    creds = _get_user_creds(int(drive_user_id))
+    if not creds:
+        return
+
+    # archive this message by calling archive logic on itself as if reply
+    try:
+        g = _ensure_group_structure(creds, msg.chat.id, msg.chat.title or str(msg.chat.id))
+        drive = drive_service(creds)
+
+        sender = msg.from_user.full_name if msg.from_user else "Unknown"
+        sender_id = msg.from_user.id if msg.from_user else ""
+        group_title = msg.chat.title or str(msg.chat.id)
+
+        # text row
+        if msg.text or msg.caption:
+            text = msg.text or msg.caption or ""
+            row = [now_iso(), group_title, sender, str(sender_id), str(msg.message_id), text]
+            append_row(creds, g["sheet_id"], row)
+
+        async def _upload(file_id: str, folder_key: str, name: str):
+            local, mime = await download_telegram_file(bot, file_id, TMP_DIR, name)
+            try:
+                upload_file(drive, local, name, g["folders"][folder_key], mime_type=mime)
+            finally:
+                try:
+                    os.remove(local)
+                except Exception:
+                    pass
+
+        if msg.photo:
+            p = msg.photo[-1]
+            await _upload(p.file_id, "photos", f"photo_{p.file_unique_id}.jpg")
+        if msg.video:
+            v = msg.video
+            await _upload(v.file_id, "videos", f"video_{v.file_unique_id}.mp4")
+        if msg.document:
+            d = msg.document
+            await _upload(d.file_id, "docs", sanitize_name(d.file_name or f"doc_{d.file_unique_id}", "document"))
+        if msg.audio:
+            a = msg.audio
+            await _upload(a.file_id, "audio", sanitize_name(a.file_name or f"audio_{a.file_unique_id}.mp3", "audio"))
+        if msg.voice:
+            v = msg.voice
+            await _upload(v.file_id, "voice", f"voice_{v.file_unique_id}.ogg")
+        if msg.sticker:
+            s = msg.sticker
+            ext = "webp" if s.is_animated is False else "tgs"
+            await _upload(s.file_id, "stickers", f"sticker_{s.file_unique_id}.{ext}")
+
+    except Exception:
+        log.exception("auto archive failed")
 
 
 if __name__ == "__main__":
+    log.info("Bot started")
     executor.start_polling(dp, skip_updates=True)

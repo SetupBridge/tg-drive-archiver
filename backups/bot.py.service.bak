@@ -1,0 +1,179 @@
+# -*- coding: utf-8 -*-
+import os
+import json
+import re
+import asyncio
+import datetime as dt
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message
+from aiogram.filters import Command
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
+# =========================
+# إعدادات عامة
+# =========================
+BASE_DIR = Path(__file__).resolve().parent
+DATA_FILE = BASE_DIR / "data.json"
+
+load_dotenv()
+
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN غير موجود. ضعه في ملف .env")
+
+# ID المجلد في Google Drive (اللي انت سويته بنفسك)
+# احصل عليه من رابط المجلد: https://drive.google.com/drive/folders/<FOLDER_ID>
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "").strip()
+if not DRIVE_FOLDER_ID:
+    raise RuntimeError("DRIVE_FOLDER_ID غير موجود. ضعه في ملف .env")
+
+# ملف Service Account JSON
+CREDS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+if not CREDS_PATH:
+    # fallback: لو عندك credentials.json في نفس مجلد المشروع
+    fallback = BASE_DIR / "credentials.json"
+    if fallback.exists():
+        CREDS_PATH = str(fallback)
+    else:
+        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS غير موجود ولا يوجد credentials.json داخل المشروع.")
+
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+
+# =========================
+# Google Drive client
+# =========================
+def get_drive_service():
+    creds = service_account.Credentials.from_service_account_file(CREDS_PATH, scopes=SCOPES)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+drive_service = get_drive_service()
+
+# =========================
+# تخزين بسيط في data.json
+# =========================
+def load_data():
+    if DATA_FILE.exists():
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def save_data(items):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+
+# =========================
+# Helpers
+# =========================
+def safe_filename(name: str) -> str:
+    name = name.strip()
+    name = re.sub(r"[^\w\-. ()\[\]{}]+", "_", name, flags=re.UNICODE)
+    if not name:
+        name = "archive"
+    return name[:150]
+
+def now_stamp():
+    return dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+async def upload_text_to_drive(text: str, note: str = "", chat_id: int = 0, from_id: int = 0):
+    """
+    يرفع ملف TXT بسيط داخل المجلد المحدد في DRIVE_FOLDER_ID.
+    """
+    out_dir = BASE_DIR / "out"
+    out_dir.mkdir(exist_ok=True)
+
+    filename = f"{now_stamp()}_{safe_filename(note) if note else 'archive'}.txt"
+    local_path = out_dir / filename
+
+    body = text
+    if note:
+        body = f"NOTE: {note}\n\n{body}"
+
+    local_path.write_text(body, encoding="utf-8")
+
+    file_metadata = {
+        "name": filename,
+        "parents": [DRIVE_FOLDER_ID],
+    }
+    media = MediaFileUpload(str(local_path), mimetype="text/plain", resumable=True)
+    created = drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+    return created.get("id")
+
+# =========================
+# Bot
+# =========================
+bot = Bot(token=TOKEN)  # parse_mode ما نستخدمه هنا عشان توافق aiogram 3
+dp = Dispatcher()
+
+@dp.message(Command("archive"))
+async def archive_handler(message: Message):
+    """
+    الحالات المطلوبة:
+    ✅ /archive لحاله -> يعطي تعليمات فقط (بدون أرشفة)
+    ✅ /archive + نص -> يتم الأرشفة ويقول تمت الأرشفة
+    ✅ الرد على رسالة ثم /archive (مع أو بدون نص) -> يتم الأرشفة
+    """
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    note = parts[1] if len(parts) > 1 else ""
+
+    replied = message.reply_to_message
+    has_reply = replied is not None
+
+    # /archive لحاله وبدون رد: تعليمات فقط
+    if (not note) and (not has_reply):
+        await message.reply("✅ اكتب /archive ثم سطر (ملاحظة) أو رد على رسالة ثم اكتب /archive علشان تتم الأرشفة.")
+        return
+
+    # محتوى الأرشفه:
+    content = ""
+    if has_reply:
+        # نحفظ نص الرسالة اللي رديت عليها (ولو ما فيها نص نخزن نوعها)
+        if replied.text:
+            content = replied.text
+        elif replied.caption:
+            content = replied.caption
+        else:
+            # لو ميديا بدون نص
+            content = f"[NON_TEXT_MESSAGE] type={replied.content_type}"
+    else:
+        # بدون رد: نأرشف النص المكتوب بعد /archive
+        content = note
+
+    # سجل في data.json
+    items = load_data()
+    items.append({
+        "chat_id": message.chat.id,
+        "from": message.from_user.id if message.from_user else 0,
+        "text": content,
+        "note": note if has_reply else "",
+        "ts": dt.datetime.now().isoformat()
+    })
+    save_data(items)
+
+    # ارفع لدرایف
+    try:
+        await upload_text_to_drive(content, note=note if has_reply else "", chat_id=message.chat.id,
+                                  from_id=message.from_user.id if message.from_user else 0)
+    except Exception as e:
+        # لو فشل الرفع نعطيك السبب صريح
+        await message.reply(f"❌ فشل الرفع إلى Google Drive:\n{e}")
+        return
+
+    await message.reply("✅ تمت الأرشفة")
+
+async def main():
+    print("✅ Bot starting polling...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())

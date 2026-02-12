@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import json
+import asyncio
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, Tuple
+
+from aiogram import Bot, Dispatcher, executor, types
+
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
+
+# =========================
+# ENV / PATHS
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN غير موجود. تأكد من ملف .env")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+TOKENS_DIR = os.path.join(DATA_DIR, "tokens")
+TMP_DIR = os.path.join(DATA_DIR, "tmp")
+STORAGE_PATH = os.path.join(DATA_DIR, "storage.json")
+CLIENT_SECRET_PATH = os.path.join(BASE_DIR, "client_secret.json")
+
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(TOKENS_DIR, exist_ok=True)
+os.makedirs(TMP_DIR, exist_ok=True)
+
+# Google scopes (Drive + Sheets)
+SCOPES = [
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
+
+# Optional Google Sheet logging
+SHEET_ID = os.getenv("SHEET_ID", "").strip()          # لو تبغى تسجيل في شيت
+SHEET_TAB = os.getenv("SHEET_TAB", "Sheet1").strip()  # اسم التبويب
+
+# Behavior
+AUTO_DELETE_SECONDS = int(os.getenv("AUTO_DELETE_SECONDS", "3").strip() or "3")
+ARCHIVE_CMD = "archive"  # /archive
+
+# (اختياري) تقييد setup على مالك محدد
+OWNER_ID_ENV = os.getenv("OWNER_ID", "").strip()
+OWNER_ID: Optional[int] = int(OWNER_ID_ENV) if OWNER_ID_ENV.isdigit() else None
+
+# =========================
+# BOT
+# =========================
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher(bot)
+
+# In-memory pending setup flows: user_id -> dict(flow, msg_id_to_delete)
+pending_setup: Dict[int, Dict[str, Any]] = {}
+
+
+# =========================
+# STORAGE HELPERS
+# =========================
+def load_storage() -> Dict[str, Any]:
+    if not os.path.exists(STORAGE_PATH):
+        return {}
+    try:
+        with open(STORAGE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_storage(data: Dict[str, Any]) -> None:
+    tmp = STORAGE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STORAGE_PATH)
+
+def get_owner_id() -> Optional[int]:
+    if OWNER_ID is not None:
+        return OWNER_ID
+    st = load_storage()
+    v = st.get("owner_id")
+    return int(v) if isinstance(v, int) else None
+
+def set_owner_id(user_id: int) -> None:
+    st = load_storage()
+    st["owner_id"] = int(user_id)
+    save_storage(st)
+
+def token_path_for_owner(owner_id: int) -> str:
+    return os.path.join(TOKENS_DIR, f"google_{owner_id}.json")
+
+
+# =========================
+# AUTO DELETE
+# =========================
+async def auto_delete_message(chat_id: int, message_id: int, delay: int = AUTO_DELETE_SECONDS) -> None:
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+async def safe_delete(chat_id: int, message_id: int) -> None:
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
+# =========================
+# GOOGLE AUTH
+# =========================
+def creds_from_file(path: str) -> Optional[Credentials]:
+    if not os.path.exists(path):
+        return None
+    try:
+        return Credentials.from_authorized_user_file(path, SCOPES)
+    except Exception:
+        return None
+
+def save_creds(path: str, creds: Credentials) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(creds.to_json())
+
+def get_drive_service(owner_id: int) -> Any:
+    tok_path = token_path_for_owner(owner_id)
+    creds = creds_from_file(tok_path)
+    if not creds:
+        raise RuntimeError("NOT_LINKED")
+
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            save_creds(tok_path, creds)
+        except RefreshError:
+            raise RuntimeError("NEED_RELINK")
+
+    return build("drive", "v3", credentials=creds)
+
+def get_sheets_service(owner_id: int) -> Any:
+    tok_path = token_path_for_owner(owner_id)
+    creds = creds_from_file(tok_path)
+    if not creds:
+        raise RuntimeError("NOT_LINKED")
+
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            save_creds(tok_path, creds)
+        except RefreshError:
+            raise RuntimeError("NEED_RELINK")
+
+    return build("sheets", "v4", credentials=creds)
+
+
+# =========================
+# ARCHIVE HELPERS
+# =========================
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+async def download_file_to_tmp(message: types.Message) -> Tuple[str, str]:
+    """
+    Returns (local_path, original_name)
+    """
+    # priority: document > video > photo
+    if message.document:
+        file_id = message.document.file_id
+        original_name = message.document.file_name or f"document_{message.message_id}"
+        ext = os.path.splitext(original_name)[1] or ".bin"
+    elif message.video:
+        file_id = message.video.file_id
+        original_name = f"video_{message.message_id}.mp4"
+        ext = ".mp4"
+    elif message.photo:
+        file_id = message.photo[-1].file_id
+        original_name = f"photo_{message.message_id}.jpg"
+        ext = ".jpg"
+    else:
+        raise RuntimeError("UNSUPPORTED")
+
+    file = await bot.get_file(file_id)
+    local_path = os.path.join(TMP_DIR, f"{file.file_unique_id}{ext}")
+    await bot.download_file(file.file_path, local_path)
+    return local_path, original_name
+
+def upload_to_drive(service: Any, local_path: str, drive_name: str, folder_id: Optional[str] = None) -> str:
+    file_metadata: Dict[str, Any] = {"name": drive_name}
+    if folder_id:
+        file_metadata["parents"] = [folder_id]
+
+    media = MediaFileUpload(local_path, resumable=True)
+    created = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id"
+    ).execute()
+    return created["id"]
+
+def append_to_sheet(service: Any, row: list) -> None:
+    if not SHEET_ID:
+        return
+    range_name = f"{SHEET_TAB}!A1"
+    body = {"values": [row]}
+    service.spreadsheets().values().append(
+        spreadsheetId=SHEET_ID,
+        range=range_name,
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body=body
+    ).execute()
+
+
+# =========================
+# PERMISSIONS TEXT (مطمّن)
+# =========================
+PERMS_TEXT = (
+    "🔐 <b>صلاحية مطلوبة داخل الجروب</b>\n\n"
+    "عشان نخلي الأوامر نظيفة وما تزعّجكم، البوت يحتاج صلاحية:\n"
+    "• <b>Delete messages</b>\n\n"
+    "✅ <b>لا تقلق</b>: البوت يحذف فقط:\n"
+    "• أمر <b>/archive</b> اللي تكتبه\n"
+    "• ورسائل البوت (جاري المعالجة / تمت الأرشفة)\n\n"
+    "ولا يلمس رسائلك العادية."
+)
+
+
+# =========================
+# COMMANDS
+# =========================
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: types.Message):
+    if message.chat.type in ("group", "supergroup"):
+        # Suggest permissions if not admin/can_delete
+        try:
+            me = await bot.get_me()
+            member = await bot.get_chat_member(message.chat.id, me.id)
+            can_delete = getattr(member, "can_delete_messages", False)
+            if not can_delete:
+                await message.reply(PERMS_TEXT)
+        except Exception:
+            pass
+
+        await message.reply(
+            "هلا 👋\n"
+            "للأرشفة داخل الجروب:\n"
+            "1) رد على الرسالة/الصورة\n"
+            "2) اكتب <b>/archive</b>\n\n"
+            "للربط مع Google: نفّذ <b>/setup</b> في الخاص مع البوت."
+        )
+        return
+
+    # private
+    await message.reply(
+        "هلا 👋\n\n"
+        "• للربط مع Google: اكتب <b>/setup</b>\n"
+        "• للأرشفة بالجروب: رد على الرسالة واكتب <b>/archive</b>\n\n"
+        "ملاحظة: /setup لازم يكون في الخاص فقط."
+    )
+
+
+@dp.message_handler(commands=["setup"])
+async def cmd_setup(message: types.Message):
+    if message.chat.type != "private":
+        await message.reply("⚠️ أمر <b>/setup</b> لازم في الخاص (داخل البوت) فقط.")
+        return
+
+    user_id = message.from_user.id
+
+    # If OWNER_ID set, restrict
+    if OWNER_ID is not None and user_id != OWNER_ID:
+        await message.reply("❌ هذا البوت مقيّد. ما تقدر تسوي setup إلا المالك.")
+        return
+
+    # If no owner recorded, set first setup user as owner
+    if get_owner_id() is None:
+        set_owner_id(user_id)
+
+    if not os.path.exists(CLIENT_SECRET_PATH):
+        await message.reply("❌ ملف <b>client_secret.json</b> غير موجود في نفس مجلد bot.py")
+        return
+
+    # Start OAuth flow
+    flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_PATH, SCOPES)
+
+    # NOTE: OOB redirect (يعتمد على إعدادات مشروعك — إذا شغال معك قبل فهو تمام)
+    flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
+
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent"
+    )
+
+    # Send instructions
+    inst = (
+        "🔗 <b>خطوة الربط مع Google</b>\n\n"
+        "1) افتح الرابط هذا:\n"
+        f"{auth_url}\n\n"
+        "2) وافق، وبيطلع لك <b>كود</b>\n"
+        "3) <b>انسخ الكود</b> والصقه هنا مباشرة (بدون أي أوامر / بدون /code)\n\n"
+        "✅ بعد ما تلصق الكود راح أكمّل الربط وأمسح الرسائل تلقائيًا."
+    )
+    sent = await message.reply(inst, disable_web_page_preview=True)
+
+    pending_setup[user_id] = {"flow": flow, "inst_msg_id": sent.message_id}
+
+    # optionally delete /setup command too
+    asyncio.create_task(auto_delete_message(message.chat.id, message.message_id, AUTO_DELETE_SECONDS))
+
+
+@dp.message_handler(lambda m: m.chat.type == "private", content_types=types.ContentTypes.TEXT)
+async def handle_private_text(message: types.Message):
+    user_id = message.from_user.id
+
+    # If waiting for oauth code
+    if user_id in pending_setup:
+        flow: InstalledAppFlow = pending_setup[user_id]["flow"]
+        inst_msg_id: int = pending_setup[user_id]["inst_msg_id"]
+
+        code = (message.text or "").strip()
+        status = await message.reply("⏳ جاري الربط مع Google...")
+
+        try:
+            flow.fetch_token(code=code)
+            creds = flow.credentials
+
+            owner_id = get_owner_id() or user_id
+            tok_path = token_path_for_owner(owner_id)
+            save_creds(tok_path, creds)
+
+            await status.edit_text("✅ تم الربط بنجاح!")
+
+            # Delete: user's code + instruction + status after delay
+            asyncio.create_task(auto_delete_message(message.chat.id, message.message_id, AUTO_DELETE_SECONDS))
+            asyncio.create_task(auto_delete_message(message.chat.id, inst_msg_id, AUTO_DELETE_SECONDS))
+            asyncio.create_task(auto_delete_message(message.chat.id, status.message_id, AUTO_DELETE_SECONDS))
+
+            pending_setup.pop(user_id, None)
+            return
+
+        except Exception:
+            await status.edit_text(
+                "❌ ما ضبط الربط.\n\n"
+                "• تأكد إنك لصقت <b>الكود فقط</b>\n"
+                "• وجرب <b>/setup</b> مرة ثانية"
+            )
+            # Keep instructions; auto delete status
+            asyncio.create_task(auto_delete_message(message.chat.id, status.message_id, AUTO_DELETE_SECONDS))
+            return
+
+    # otherwise ignore normal texts in private
+    # (نخليه هادي)
+    return
+
+
+# =========================
+# ARCHIVE COMMAND (Groups)
+# =========================
+@dp.message_handler(commands=[ARCHIVE_CMD], chat_type=["group", "supergroup"])
+async def cmd_archive_group(message: types.Message):
+    # Must be a reply
+    if not message.reply_to_message:
+        m = await message.reply("ℹ️ استخدمها كذا: رد على الرسالة/الصورة ثم اكتب <b>/archive</b>")
+        asyncio.create_task(auto_delete_message(message.chat.id, m.message_id, AUTO_DELETE_SECONDS))
+        asyncio.create_task(auto_delete_message(message.chat.id, message.message_id, AUTO_DELETE_SECONDS))
+        return
+
+    owner_id = get_owner_id()
+    if not owner_id:
+        m = await message.reply("⚠️ لازم تسوي <b>/setup</b> في الخاص أولاً.")
+        asyncio.create_task(auto_delete_message(message.chat.id, m.message_id, AUTO_DELETE_SECONDS))
+        asyncio.create_task(auto_delete_message(message.chat.id, message.message_id, AUTO_DELETE_SECONDS))
+        return
+
+    # Status message
+    status = await message.reply("⏳ جاري المعالجة...")
+
+    # Try permissions check (optional)
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(message.chat.id, me.id)
+        can_delete = getattr(member, "can_delete_messages", False)
+        if not can_delete:
+            warn = await message.reply(PERMS_TEXT)
+            asyncio.create_task(auto_delete_message(message.chat.id, warn.message_id, 10))
+    except Exception:
+        pass
+
+    try:
+        drive = get_drive_service(owner_id)
+        sheets = None
+        if SHEET_ID:
+            try:
+                sheets = get_sheets_service(owner_id)
+            except Exception:
+                sheets = None
+
+        target = message.reply_to_message
+
+        # Text-only archive: save as txt to drive
+        if target.text or target.caption:
+            text = target.text or target.caption or ""
+            fname = f"tg_text_{message.chat.id}_{target.message_id}.txt"
+            local_path = os.path.join(TMP_DIR, fname)
+            with open(local_path, "w", encoding="utf-8") as f:
+                f.write(text)
+
+            file_id = upload_to_drive(drive, local_path, fname, folder_id=None)
+
+            if sheets:
+                append_to_sheet(
+                    sheets,
+                    [
+                        now_iso(),
+                        str(message.chat.id),
+                        str(target.message_id),
+                        "text",
+                        (message.from_user.username or ""),
+                        (message.from_user.full_name or ""),
+                        "OK",
+                    ],
+                )
+
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+
+        else:
+            # Media archive
+            local_path, original_name = await download_file_to_tmp(target)
+            drive_name = f"{message.chat.id}_{target.message_id}_{original_name}"
+            file_id = upload_to_drive(drive, local_path, drive_name, folder_id=None)
+
+            if sheets:
+                kind = "file"
+                if target.photo:
+                    kind = "photo"
+                elif target.video:
+                    kind = "video"
+                elif target.document:
+                    kind = "document"
+
+                append_to_sheet(
+                    sheets,
+                    [
+                        now_iso(),
+                        str(message.chat.id),
+                        str(target.message_id),
+                        kind,
+                        (message.from_user.username or ""),
+                        (message.from_user.full_name or ""),
+                        "OK",
+                    ],
+                )
+
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+
+        # ✅ Done (no Drive link)
+        await status.edit_text("✅ تمت الأرشفة")
+
+        # Auto delete messages (command + status) after 3s
+        asyncio.create_task(auto_delete_message(message.chat.id, message.message_id, AUTO_DELETE_SECONDS))
+        asyncio.create_task(auto_delete_message(message.chat.id, status.message_id, AUTO_DELETE_SECONDS))
+
+    except RuntimeError as e:
+        if str(e) == "NOT_LINKED":
+            await status.edit_text("⚠️ لازم تسوي <b>/setup</b> في الخاص أولاً.")
+        elif str(e) == "NEED_RELINK":
+            await status.edit_text("⚠️ انتهت صلاحية الربط. سوِّ <b>/setup</b> مرة ثانية في الخاص.")
+        else:
+            await status.edit_text("❌ صار خطأ أثناء الأرشفة.")
+        asyncio.create_task(auto_delete_message(message.chat.id, message.message_id, AUTO_DELETE_SECONDS))
+        asyncio.create_task(auto_delete_message(message.chat.id, status.message_id, AUTO_DELETE_SECONDS))
+
+    except Exception:
+        await status.edit_text("❌ صار خطأ أثناء الأرشفة.")
+        asyncio.create_task(auto_delete_message(message.chat.id, message.message_id, AUTO_DELETE_SECONDS))
+        asyncio.create_task(auto_delete_message(message.chat.id, status.message_id, AUTO_DELETE_SECONDS))
+
+
+# =========================
+# ARCHIVE COMMAND (Private) - optional guide
+# =========================
+@dp.message_handler(commands=[ARCHIVE_CMD], chat_type=["private"])
+async def cmd_archive_private(message: types.Message):
+    await message.reply(
+        "ℹ️ الأرشفة تنفع داخل الجروبات.\n"
+        "في الجروب: رد على الرسالة/الصورة ثم اكتب <b>/archive</b>."
+    )
+    asyncio.create_task(auto_delete_message(message.chat.id, message.message_id, AUTO_DELETE_SECONDS))
+
+
+# =========================
+# MAIN
+# =========================
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True)

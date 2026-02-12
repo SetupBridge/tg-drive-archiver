@@ -1,0 +1,29 @@
+{
+  "chats": {
+    "-1003637982288": {
+      "google": {
+        "token": "ya29.a0AUMWg_KStHieOJVkRNLmTbOd-vzS7KQKynwMt2dAnki7HHgjiWfOLWZy58mt7152lHBBsLAvNf6yv3HkEhdkApX6Eh-ynl0Mw7n4OKBr5Kb3D6gRJZk7znN6LSTceW7YXk4mb3nF8HJAyOa3zAlWQM93Z9a25_Qtcdp_WprsviZLzfGKaJSo3mizsJ8KASy53QFok8waCgYKAQoSARUSFQHGX2Mi-zsrxeAfY-tHccbT8qFfCg0206",
+        "refresh_token": "1//03neNGzbWDo6GCgYIARAAGAMSNwF-L9IrtnXkNJDxY-aGrSrMLPhdKmB_1ZQbcFaYSXp4GTuVwX2QC-BhH_QwUjzCQADfid3SaWQ",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "client_id": "34141538280-7criug2bfv7tqs937odv9pffdtkv2br2.apps.googleusercontent.com",
+        "client_secret": "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",
+        "scopes": [
+          "https://www.googleapis.com/auth/drive.file"
+        ]
+      },
+      "drive": {
+        "root_id": "1C3u4YCW-sS8Zk2RINGdhTHhPOTksvuno",
+        "archive_root_id": "1gbfTuoAZNJnRGixdq7uFs5idVErDQJv2",
+        "folders": {
+          "photos": "1o0RKymbZEmZETceFPcDOBVUaMDCKw2_l",
+          "videos": "1ehl5GA5vWuBTkaHyunxSasfcOp-tvx7d",
+          "documents": "1Cc_xMeOtSVWwZwIvEQBIxTO6bfVPtZH7",
+          "audio": "11bJKMap4EntgJiIxg2u84pGDuQ9TWNTD",
+          "texts": "1gZ2c7AWYmN5qTcKvKfbxLwf3XbkucGJE"
+        }
+      }
+    }
+  },
+  "pending": {},
+  "device_flow": {}
+}
